@@ -1,0 +1,1699 @@
+/* =========================================================================
+   SPIDER-MAN RESCUE: INTERACTIVE URBAN RESCUE SIMULATION
+   =========================================================================
+   C++ / OpenGL / GLUT -- single-file implementation
+   Computer Graphics Lab -- Final Showcase Project
+
+   A citizen stands on a rooftop edge while a countdown runs. Press 'S'
+   any time before or during the fall to send Spider-Man homing in on a
+   web to make the rescue -- the swing continuously re-aims at the
+   citizen's live position, so a catch is possible from anywhere, at any
+   timing. Missing the window resolves to a clear, non-graphic MISSION
+   FAILED outcome: a brief particle burst, and the citizen stays visible,
+   resting at ground level, rather than vanishing off-screen. The city
+   runs continuously in the background: traffic, pedestrians, birds, a
+   distant airliner, drifting clouds, and a smooth day/night transition.
+
+   ARCHITECTURE -- built entirely from manual graphics algorithms:
+     1. PRIMITIVES: setPixel, ddaLine (DDA), bresenhamLine (Bresenham),
+        midpointCircle (Midpoint Circle), bezierCurve (the web line),
+        cohenSutherlandClip (line clipping against the viewport).
+     2. TRANSFORMATIONS: translatePoint / scalePoint / rotatePoint, used
+        everywhere something moves, scales, or rotates -- traffic and
+        pedestrian motion, the fall, figure posing (including the
+        lying-down FAILURE pose and the walk cycle), night wet-road
+        mirroring, and Spider-Man's homing swing.
+     3. COLOR AND ANIMATION: a ModePalette day/night system lerped over
+        time; motion advances on a fixed FIXED_DT timestep in a 30ms
+        glutTimerFunc loop.
+     4. APPLICATION DESIGN: a GameState machine, keyboard input,
+        collision detection, a HUD, and a startup layout self-check.
+
+   File layout (search these banner comments to navigate): GLOBAL
+   CONSTANTS, ENUMS, BASIC STRUCTS, GRAPHICS PRIMITIVES AND ALGORITHMS,
+   2D TRANSFORMATIONS, LIGHTING, INITIALIZATION, ENVIRONMENT DRAWING,
+   ACTORS, IMPACT PARTICLES, HUD, GAME LOGIC, KEYBOARD, GLUT CALLBACKS,
+   RESTART / INIT / DIAGNOSTICS, MAIN.
+
+   CONTROLS
+     S  Save the citizen        D  Day        N  Night      P  Pause
+     G  Debug grid              H  Controls help panel      R  Restart
+     Esc / Q  Quit
+
+   BUILD (Linux)
+     g++ -std=c++17 main.cpp -o main -lglut -lGLU -lGL -lm && ./main
+   No GLEW dependency; only classic/standard GLUT entry points are used.
+   ========================================================================= */
+
+#include <GL/glut.h>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <algorithm>
+
+using namespace std;
+
+// ------------------------------------------------------------------
+// Global constants / layout
+// ------------------------------------------------------------------
+// The scene is laid out in world-space pixels that map 1:1 to the initial
+// window size via gluOrtho2D in reshape(); resizing the window stretches
+// this coordinate system rather than changing it. Vertical bands, from
+// the bottom of the window upward: road, sidewalk, then buildings rising
+// from the sidewalk line.
+const int    WINDOW_WIDTH  = 1150;
+const int    WINDOW_HEIGHT = 720;
+const char*  WINDOW_TITLE  = "Spider-Man Rescue | CG Lab Project";
+const double PI = 3.14159265358979323846;
+
+const double GROUND_Y   = 0.0;
+const double ROAD_Y     = 90.0;
+const double ROAD_H     = 66.0;
+const double SIDEWALK_Y = ROAD_Y + ROAD_H;
+const double SIDEWALK_H = 26.0;
+
+const double GRAVITY = 260.0;              // px/s^2, shared by the victim's fall and the impact particles
+const double FIXED_DT = 0.03;              // fixed per-tick timestep (30ms timer)
+const int    TIMER_MS = 30;
+
+const double COUNTDOWN_START = 5.0;        // seconds the player has in WAITING before the citizen jumps
+const double LIGHT_TRANSITION_STEP = 0.02; // fraction of the day<->night lerp advanced per tick (~1.5s full transition)
+
+// ------------------------------------------------------------------
+// Enums
+// ------------------------------------------------------------------
+// GameState: the rescue story's state machine. WAITING and JUMPING are
+// the only states the player's 'S' key can act on; every other transition
+// happens automatically once its condition is met (see updateGame's
+// switch statement for exactly what drives each one).
+enum class GameState { WAITING, JUMPING, RESCUE, CARRY, TALK, WALK, SUCCESS, FAILURE };
+// LightingMode: only two concrete lighting states exist; everything that
+// looks "in between" on screen is lerpPalette blending toward whichever of
+// these two is currently the requested target (see nextLightMode).
+enum class LightingMode { DAY, NIGHT };
+
+GameState    state = GameState::WAITING;
+double       stateTimer = 0.0;   // seconds spent in the current state
+double       countdown  = COUNTDOWN_START; // seconds left in WAITING
+bool         isPaused = false;
+bool         showWeb = false;
+bool         spiderActive = false;
+bool         showDebugGrid = false;
+bool         showControlsPanel = false;
+
+// ------------------------------------------------------------------
+// Basic structs
+// ------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// Scene entity structs. Every entity is a plain-old-data struct rather
+// than a class hierarchy -- there's no shared behavior between, say, a
+// Building and a Cloud, so composition-by-struct plus free functions keeps
+// each concept's data next to its own draw/update logic instead of behind
+// virtual dispatch that this scene has no real use for.
+// -------------------------------------------------------------------------
+struct Point2D { double x, y; };
+
+// Building: a rectangle plus a base tint, multiplied by
+// currentPalette.buildingShade at draw time so it adapts to both lighting modes.
+struct Building { double x, w, h; double r, g, b; };
+// Vehicle: a positioned, colored rectangle with its own speed and size;
+// isBus swaps in the multi-pane window layout and an extra rear wheel.
+struct Vehicle  { double x, speed, w, h; double r, g, b; bool isBus; };
+// Outfit: a small realistic color set for a human figure -- skin tone,
+// hair color, shirt color, and pants color -- so pedestrians/the citizen
+// read as clothed people rather than single-color silhouettes.
+struct Outfit { double skinR,skinG,skinB, hairR,hairG,hairB, shirtR,shirtG,shirtB, pantsR,pantsG,pantsB; };
+
+// Pedestrian: walks along the sidewalk only (fixed y); walkPhase drives the
+// rotatePoint-based leg-swing animation independently per pedestrian.
+struct Pedestrian { double x, speed; Outfit outfit; double walkPhase; };
+// Tree: position plus a uniform size multiplier used for the trunk and the
+// three-circle canopy composition in drawTreeAt.
+struct Tree     { double x; double size; };
+// StreetLamp: position only -- height, glow radius, and on/off state are
+// all derived from constants and currentPalette.lampOn at draw time.
+struct StreetLamp { double x; };
+// Cloud: position, a size multiplier, and its own drift speed so the sky
+// doesn't read as a single repeated shape moving in lockstep.
+struct Cloud    { double x, y, scale, speed; };
+// Particle: one dot of the impact-burst effect -- position, velocity, and
+// a life value in [0,1] that doubles as its render alpha.
+struct Particle { double x, y, vx, vy, life; };
+// Bird: position, horizontal speed, and a wingPhase used to animate the
+// simple two-stroke "V" wing shape in drawBirds.
+struct Bird     { double x, y, speed, wingPhase; };
+
+vector<Building>   buildings;
+vector<Vehicle>    vehicles;
+vector<Pedestrian> pedestrians;
+vector<Tree>       trees;
+vector<StreetLamp> streetLamps;
+vector<Cloud>      clouds;
+vector<Particle>   particles;
+vector<Bird>        birds;
+bool particlesActive = false;
+
+// Story-critical building indices, all zero-based into the `buildings`
+// vector but commented with their 1-based "Building N" name since that's
+// how they're referred to in the on-screen story and in conversation.
+// Keeping these as named constants (rather than magic numbers scattered
+// through the rescue logic) is what verifyLayoutNonOverlapping checks for
+// distinctness at startup.
+const int JUMP_BUILDING   = 3; // Building 4 - victim's rooftop
+const int WEB_BUILDING    = 5; // Building 6 - Spider-Man's start
+const int ANCHOR_BUILDING = 4; // Building 5 - web anchor point
+const int LAND_BUILDING   = 2; // Building 3 - safe landing spot
+
+// victim / spider hold each actor's current world-space position (and, for
+// the victim, fall velocity); webAnchor is the fixed point the swing
+// pivots around for the duration of one rescue attempt.
+Point2D victim, victimVel;
+Outfit  victimOutfit = { 0.87,0.68,0.53,  0.30,0.20,0.13,  0.55,0.70,0.85,  0.20,0.28,0.45 };
+Point2D spider;
+Point2D webAnchor;
+double  swingAngleDeg = 0.0;   // degrees, fed through rotatePoint
+double  swingLen = 0.0;        // current web length (reels toward the victim each tick)
+
+double sunMoonAngle = 0.0;
+
+// Global tick counter -- incremented once per fixed-timestep update. Used
+// purely for the on-screen diagnostics panel (elapsed simulated seconds)
+// and to seed the brief camera-shake effect on a failed rescue.
+long   tickCounter = 0;
+double shakeTimeLeft = 0.0;
+
+// ------------------------------------------------------------------
+// Day / Night palette (lerp-based lighting system)
+// ------------------------------------------------------------------
+struct ModePalette {
+    double skyTopR, skyTopG, skyTopB;
+    double skyBotR, skyBotG, skyBotB;
+    double buildingShade;
+    double windowLitChance;
+    double lampOn;
+    double sunAlpha, moonAlpha;
+    double sunR, sunG, sunB;
+};
+
+const ModePalette PALETTE_DAY = {
+    // skyTopR/G/B      skyBotR/G/B        shade wLit lamp  sunA moonA  sunR  sunG  sunB
+    0.53, 0.80, 0.98,
+    0.85, 0.93, 1.00,
+    0.55, 0.05, 0.0,
+    1.0, 0.0,
+    1.0, 0.85, 0.35
+};
+// Deep night: near-black sky, high window-lit chance, lamps fully on,
+// moon fully visible, sun fully hidden -- the mirror image of PALETTE_DAY.
+const ModePalette PALETTE_NIGHT = {
+    0.03, 0.05, 0.15,
+    0.10, 0.12, 0.25,
+    0.20, 0.80, 1.0,
+    0.0, 1.0,
+    0.92, 0.92, 0.96
+};
+
+LightingMode activeLightMode = LightingMode::DAY;
+LightingMode nextLightMode   = LightingMode::DAY;
+double       lightTransition = 1.0;   // 1.0 = settled on activeLightMode
+ModePalette  currentPalette  = PALETTE_DAY;
+
+// ------------------------------------------------------------------
+// Forward declarations
+// ------------------------------------------------------------------
+// These are called from earlier in the file than they're defined
+// (restartGame from keyboard(), activeParticleCount from drawInfoPanel(),
+// logEvent from several state-transition sites, drawFigure from
+// drawPedestrians before its own definition) -- declared here once so
+// the rest of the file can be read roughly top-to-bottom in execution
+// order without needing every helper defined before its first use.
+void restartGame();
+int  activeParticleCount();
+void logEvent(const string& msg);
+void drawFigure(double x, double y, const Outfit& o, double scale, double rotDeg, double legSwing);
+
+// =====================================================================
+// GRAPHICS PRIMITIVES AND ALGORITHMS
+// =====================================================================
+
+// Plots exactly one pixel -- the base primitive every line/circle
+// algorithm below is ultimately built from, kept as its own function so
+// ddaLine/bresenhamLine/midpointCircle read as "plot these particular
+// pixels" rather than repeating glBegin(GL_POINTS)/glVertex2i/glEnd
+// triplets inline at every call site.
+void setPixel(int x, int y) {
+    glBegin(GL_POINTS);
+        glVertex2i(x, y);
+    glEnd();
+}
+
+// DDA line -- used for window mullions, lane markings, thin guide lines
+void ddaLine(double x0, double y0, double x1, double y1) {
+    double dx = x1 - x0, dy = y1 - y0;
+    int steps = (int) max(fabs(dx), fabs(dy));
+    if (steps == 0) { setPixel((int)x0, (int)y0); return; }
+    double xInc = dx / steps, yInc = dy / steps;
+    double x = x0, y = y0;
+    glBegin(GL_POINTS);
+    for (int i = 0; i <= steps; ++i) {
+        glVertex2i((int)round(x), (int)round(y));
+        x += xInc; y += yInc;
+    }
+    glEnd();
+}
+
+// Bresenham line -- used for figure limbs, web strand accents, edges
+void bresenhamLine(int x0, int y0, int x1, int y1) {
+    int dx = abs(x1 - x0), dy = abs(y1 - y0);
+    int sx = (x0 < x1) ? 1 : -1;
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx - dy;
+    glBegin(GL_POINTS);
+    while (true) {
+        glVertex2i(x0, y0);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
+    glEnd();
+}
+
+// Midpoint Circle algorithm -- heads, wheels, sun/moon, stars, canopies
+void midpointCircle(double xcF, double ycF, double radius, bool filled) {
+    int xc = (int)xcF, yc = (int)ycF;
+    int x = 0, y = (int)radius;
+    int d = 1 - (int)radius;
+
+    auto plotOctants = [&](int px, int py) {
+        if (!filled) {
+            glBegin(GL_POINTS);
+                glVertex2i(xc+px, yc+py); glVertex2i(xc-px, yc+py);
+                glVertex2i(xc+px, yc-py); glVertex2i(xc-px, yc-py);
+                glVertex2i(xc+py, yc+px); glVertex2i(xc-py, yc+px);
+                glVertex2i(xc+py, yc-px); glVertex2i(xc-py, yc-px);
+            glEnd();
+        } else {
+            glBegin(GL_LINES);
+                glVertex2i(xc-px, yc+py); glVertex2i(xc+px, yc+py);
+                glVertex2i(xc-px, yc-py); glVertex2i(xc+px, yc-py);
+                glVertex2i(xc-py, yc+px); glVertex2i(xc+py, yc+px);
+                glVertex2i(xc-py, yc-px); glVertex2i(xc+py, yc-px);
+            glEnd();
+        }
+    };
+
+    plotOctants(x, y);
+    while (x < y) {
+        x++;
+        if (d < 0) d += 2*x + 1;
+        else { y--; d += 2*(x - y) + 1; }
+        plotOctants(x, y);
+    }
+}
+
+// Cubic Bezier -- used for the sagging web line during the swing
+void bezierCurve(Point2D p0, Point2D p1, Point2D p2, Point2D p3, int segments) {
+    glBegin(GL_LINE_STRIP);
+    for (int i = 0; i <= segments; ++i) {
+        double t = (double)i / segments, u = 1.0 - t;
+        double bx = u*u*u*p0.x + 3*u*u*t*p1.x + 3*u*t*t*p2.x + t*t*t*p3.x;
+        double by = u*u*u*p0.y + 3*u*u*t*p1.y + 3*u*t*t*p2.y + t*t*t*p3.y;
+        glVertex2f((float)bx, (float)by);
+    }
+    glEnd();
+}
+
+// -------------------------------------------------------------------------
+// Cohen-Sutherland line clipping
+// -------------------------------------------------------------------------
+// Classic region-code line-clipping algorithm, applied against the window
+// viewport -- used to keep the web strand and debug grid correctly
+// bounded even under extreme window resizes.
+//
+// Region codes (outcodes), one bit per boundary:
+//     1001 | 1000 | 1010      bit 0 (LEFT)   : x < xmin
+//     -----+------+-----      bit 1 (RIGHT)  : x > xmax
+//     0001 | 0000 | 0010      bit 2 (BOTTOM) : y < ymin
+//     -----+------+-----      bit 3 (TOP)    : y > ymax
+//     0101 | 0100 | 0110
+const int CLIP_INSIDE = 0;
+const int CLIP_LEFT   = 1;
+const int CLIP_RIGHT  = 2;
+const int CLIP_BOTTOM = 4;
+const int CLIP_TOP    = 8;
+
+int computeOutCode(double x, double y, double xmin, double ymin, double xmax, double ymax) {
+    int code = CLIP_INSIDE;
+    if      (x < xmin) code |= CLIP_LEFT;
+    else if (x > xmax) code |= CLIP_RIGHT;
+    if      (y < ymin) code |= CLIP_BOTTOM;
+    else if (y > ymax) code |= CLIP_TOP;
+    return code;
+}
+
+// Clips the segment (x0,y0)-(x1,y1) against [xmin,xmax] x [ymin,ymax].
+// Returns true and overwrites the endpoints if any part of the segment is
+// visible; returns false if the whole segment lies outside the window.
+bool cohenSutherlandClip(double& x0, double& y0, double& x1, double& y1,
+                          double xmin, double ymin, double xmax, double ymax) {
+    int outcode0 = computeOutCode(x0, y0, xmin, ymin, xmax, ymax);
+    int outcode1 = computeOutCode(x1, y1, xmin, ymin, xmax, ymax);
+    bool accept = false;
+
+    while (true) {
+        if (!(outcode0 | outcode1)) {
+            // Both endpoints inside the clip window.
+            accept = true;
+            break;
+        } else if (outcode0 & outcode1) {
+            // Both endpoints share an outside region -> segment fully rejected.
+            break;
+        } else {
+            // At least one endpoint is outside; pick it and clip against
+            // whichever boundary it violates.
+            double x = 0.0, y = 0.0;
+            int outcodeOut = outcode0 ? outcode0 : outcode1;
+
+            if (outcodeOut & CLIP_TOP) {
+                x = x0 + (x1 - x0) * (ymax - y0) / (y1 - y0);
+                y = ymax;
+            } else if (outcodeOut & CLIP_BOTTOM) {
+                x = x0 + (x1 - x0) * (ymin - y0) / (y1 - y0);
+                y = ymin;
+            } else if (outcodeOut & CLIP_RIGHT) {
+                y = y0 + (y1 - y0) * (xmax - x0) / (x1 - x0);
+                x = xmax;
+            } else { // CLIP_LEFT
+                y = y0 + (y1 - y0) * (xmin - x0) / (x1 - x0);
+                x = xmin;
+            }
+
+            if (outcodeOut == outcode0) {
+                x0 = x; y0 = y;
+                outcode0 = computeOutCode(x0, y0, xmin, ymin, xmax, ymax);
+            } else {
+                x1 = x; y1 = y;
+                outcode1 = computeOutCode(x1, y1, xmin, ymin, xmax, ymax);
+            }
+        }
+    }
+    return accept;
+}
+
+// Draws a Bresenham-rasterized segment only after clipping it to the
+// window bounds -- used for the web strand so a swing that overshoots the
+// window during a resize never produces off-screen artifacts.
+void drawClippedLine(double x0, double y0, double x1, double y1) {
+    double cx0 = x0, cy0 = y0, cx1 = x1, cy1 = y1;
+    if (cohenSutherlandClip(cx0, cy0, cx1, cy1, 0.0, 0.0, (double)WINDOW_WIDTH, (double)WINDOW_HEIGHT)) {
+        bresenhamLine((int)cx0, (int)cy0, (int)cx1, (int)cy1);
+    }
+}
+
+// filled=true draws a solid GL_QUADS rectangle; filled=false draws just
+// its GL_LINE_LOOP outline. Used for everything axis-aligned in the
+// scene: torsos, building bodies, vehicle bodies, HUD panels.
+void drawRectangle(double x, double y, double w, double h, bool filled) {
+    glBegin(filled ? GL_QUADS : GL_LINE_LOOP);
+        glVertex2f((float)x, (float)y);
+        glVertex2f((float)(x+w), (float)y);
+        glVertex2f((float)(x+w), (float)(y+h));
+        glVertex2f((float)x, (float)(y+h));
+    glEnd();
+}
+
+// Thin wrapper around GLUT's bitmap font rendering, bundling the color
+// set + raster position + character loop that would otherwise be repeated
+// at every text call site in the HUD and banners.
+void drawText(double x, double y, const string& text, void* font, double r, double g, double b) {
+    glColor3f((float)r, (float)g, (float)b);
+    glRasterPos2f((float)x, (float)y);
+    for (char c : text) glutBitmapCharacter(font, c);
+}
+
+// Measures the pixel width of the string in the given bitmap font (via
+// glutBitmapWidth) and calls drawText with an x offset that centers it on
+// cx -- used by every banner and HUD headline.
+void drawCenteredText(double cx, double y, const string& text, void* font, double r, double g, double b) {
+    int w = 0;
+    for (char c : text) w += glutBitmapWidth(font, c);
+    drawText(cx - w / 2.0, y, text, font, r, g, b);
+}
+
+// =====================================================================
+// 2D TRANSFORMATIONS
+// =====================================================================
+// Three explicit, reusable transform functions -- every place in this
+// program that moves, resizes, or rotates a point goes through one of
+// these rather than inlining the arithmetic at the call site. This keeps
+// the transform math itself in exactly one place (easy to verify/quote in
+// a report) and makes every call site read as "translate/scale/rotate
+// this point" rather than a wall of unlabeled add/multiply/trig.
+
+// Translation: simple vector addition. dx/dy can be any signed offset;
+// most call sites derive them from a velocity times FIXED_DT.
+Point2D translatePoint(const Point2D& p, double dx, double dy) {
+    return { p.x + dx, p.y + dy };
+}
+
+// Scaling about an arbitrary pivot (not just the origin): shift the point
+// into pivot-relative coordinates, scale each axis independently by
+// sx/sy, then shift back. sx == sy gives uniform scaling; sy = -1 (as
+// used by drawWetReflections) gives a vertical mirror about the pivot.
+Point2D scalePoint(const Point2D& p, const Point2D& pivot, double sx, double sy) {
+    Point2D rel = { p.x - pivot.x, p.y - pivot.y };
+    rel.x *= sx; rel.y *= sy;
+    return { rel.x + pivot.x, rel.y + pivot.y };
+}
+
+// Rotation about an arbitrary pivot, angle given in degrees for
+// readability at call sites (converted to radians internally). Standard
+// 2x2 rotation matrix applied to pivot-relative coordinates. This is the
+// function underlying Spider-Man's entire swing motion (updateSpiderSwing)
+// and the pedestrians' leg-swing walk cycle (drawPedestrians).
+Point2D rotatePoint(const Point2D& p, const Point2D& pivot, double angleDegrees) {
+    double rad = angleDegrees * PI / 180.0;
+    double cosA = cos(rad), sinA = sin(rad);
+    Point2D rel = { p.x - pivot.x, p.y - pivot.y };
+    Point2D rotated = { rel.x*cosA - rel.y*sinA, rel.x*sinA + rel.y*cosA };
+    return { rotated.x + pivot.x, rotated.y + pivot.y };
+}
+
+// =====================================================================
+// LIGHTING (day / night lerp)
+// =====================================================================
+// Looks up the constant palette for a given mode -- the only two concrete
+// lighting states in the program; every on-screen color you actually see
+// is either one of these two structs directly, or lerpPalette's
+// interpolation between them.
+ModePalette paletteForMode(LightingMode mode) {
+    return mode == LightingMode::DAY ? PALETTE_DAY : PALETTE_NIGHT;
+}
+
+ModePalette lerpPalette(const ModePalette& a, const ModePalette& b, double t) {
+    t = max(0.0, min(1.0, t));
+    ModePalette r;
+    r.skyTopR = a.skyTopR + (b.skyTopR - a.skyTopR)*t;
+    r.skyTopG = a.skyTopG + (b.skyTopG - a.skyTopG)*t;
+    r.skyTopB = a.skyTopB + (b.skyTopB - a.skyTopB)*t;
+    r.skyBotR = a.skyBotR + (b.skyBotR - a.skyBotR)*t;
+    r.skyBotG = a.skyBotG + (b.skyBotG - a.skyBotG)*t;
+    r.skyBotB = a.skyBotB + (b.skyBotB - a.skyBotB)*t;
+    r.buildingShade    = a.buildingShade + (b.buildingShade - a.buildingShade)*t;
+    r.windowLitChance  = a.windowLitChance + (b.windowLitChance - a.windowLitChance)*t;
+    r.lampOn           = a.lampOn + (b.lampOn - a.lampOn)*t;
+    r.sunAlpha  = a.sunAlpha  + (b.sunAlpha  - a.sunAlpha)*t;
+    r.moonAlpha = a.moonAlpha + (b.moonAlpha - a.moonAlpha)*t;
+    r.sunR = a.sunR + (b.sunR - a.sunR)*t;
+    r.sunG = a.sunG + (b.sunG - a.sunG)*t;
+    r.sunB = a.sunB + (b.sunB - a.sunB)*t;
+    return r;
+}
+
+// Advances the day/night crossfade by one fixed step per tick whenever a
+// transition is in progress (see requestLightMode), then snaps
+// activeLightMode over once the interpolation reaches 1.0 so subsequent
+// calls stop re-lerping between two identical palettes.
+void updateLighting() {
+    if (lightTransition < 1.0) {
+        lightTransition = min(1.0, lightTransition + LIGHT_TRANSITION_STEP);
+        currentPalette = lerpPalette(paletteForMode(activeLightMode), paletteForMode(nextLightMode), lightTransition);
+        if (lightTransition >= 1.0) activeLightMode = nextLightMode;
+    } else {
+        currentPalette = paletteForMode(activeLightMode);
+    }
+}
+
+// Called by the 'D'/'N' keys: sets the target mode and resets
+// lightTransition to 0 so updateLighting starts a fresh crossfade toward
+// it. A no-op if we're already settled on the requested mode.
+void requestLightMode(LightingMode mode) {
+    if (mode == activeLightMode && lightTransition >= 1.0) return;
+    nextLightMode = mode;
+    lightTransition = 0.0;
+    logEvent(mode == LightingMode::DAY ? "Lighting transitioning to DAY." : "Lighting transitioning to NIGHT.");
+}
+
+// =====================================================================
+// INITIALIZATION
+// =====================================================================
+// Nine buildings laid out left to right with hand-tuned widths/heights so
+// the skyline reads as varied rather than a uniform repeated block. Colors
+// are muted blue-grays, later modulated per-frame by currentPalette so the
+// same base building looks right in both day and night lighting. The last
+// two are purely decorative background buildings (no story role) added to
+// carry the skyline across the full window width instead of leaving open
+// sky past Building 7 -- the game's building indices below only ever
+// reference the first seven, so they're unaffected by the addition.
+void initBuildings() {
+    buildings.clear();
+    double widths[9]  = {110, 95, 100, 90, 100, 95, 115, 95, 80};
+    double heights[9] = {260, 300, 340, 430, 320, 380, 270, 230, 195};
+    double cols[9][3] = {
+        {0.42,0.45,0.55}, {0.35,0.40,0.50}, {0.45,0.48,0.58},
+        {0.30,0.34,0.46}, {0.40,0.44,0.54}, {0.33,0.37,0.48},
+        {0.44,0.47,0.57}, {0.50,0.54,0.63}, {0.55,0.59,0.67} // hazier, more distant tones
+    };
+    double x = 20.0;
+    for (int i = 0; i < 9; ++i) {
+        buildings.push_back({x, widths[i], heights[i], cols[i][0], cols[i][1], cols[i][2]});
+        x += widths[i] + 18.0;
+    }
+}
+
+// Small helpers used everywhere a rooftop position or a building's
+// horizontal midpoint is needed (rescue logic, figure placement, rooftop
+// detail drawing) -- centralizing the +SIDEWALK_Y / *0.5 arithmetic here
+// instead of repeating it at each call site.
+double buildingTopY(int idx)    { return SIDEWALK_Y + buildings[idx].h; }
+double buildingCenterX(int idx) { return buildings[idx].x + buildings[idx].w * 0.5; }
+
+// Four ordinary vehicles plus one bus, staggered off-screen starts and
+// varied speeds so traffic doesn't read as a repeating identical train.
+void initVehicles() {
+    vehicles.clear();
+    vehicles.push_back({ -80,  70, 58, 26, 0.80,0.15,0.15, false });
+    vehicles.push_back({ -300, 45, 90, 32, 0.20,0.35,0.55, false });
+    vehicles.push_back({ -520, 90, 52, 24, 0.85,0.75,0.15, false });
+    vehicles.push_back({ -700, 55, 60, 26, 0.25,0.65,0.35, false });
+    vehicles.push_back({ -940, 38, 130, 40, 0.15,0.55,0.25, true  }); // a city bus, slower and longer
+}
+
+// Four sidewalk pedestrians, half walking left, half walking right (mixed
+// sign speeds), each with a distinct, realistic skin/hair/shirt/pants
+// outfit and its own walkPhase offset so their leg-swing animations
+// aren't visibly synchronized.
+void initPedestrians() {
+    pedestrians.clear();
+    Outfit o1 = { 0.94,0.80,0.66,  0.10,0.08,0.07,  0.85,0.35,0.30,  0.18,0.20,0.24 }; // light skin, dark hair, red shirt, charcoal pants
+    Outfit o2 = { 0.55,0.38,0.26,  0.05,0.04,0.04,  0.25,0.45,0.65,  0.15,0.15,0.18 }; // deep skin, black hair, blue shirt, near-black pants
+    Outfit o3 = { 0.80,0.62,0.48,  0.35,0.24,0.14,  0.40,0.65,0.45,  0.30,0.22,0.14 }; // tan skin, brown hair, green shirt, brown pants
+    Outfit o4 = { 0.90,0.72,0.58,  0.60,0.55,0.50,  0.70,0.55,0.80,  0.12,0.16,0.22 }; // fair skin, grey hair, lavender shirt, navy pants
+    pedestrians.push_back({120,  14, o1, 0.0});
+    pedestrians.push_back({260, -11, o2, 1.4});
+    pedestrians.push_back({700,  12, o3, 2.8});
+    pedestrians.push_back({860, -13, o4, 4.2});
+}
+
+// Trees spaced along the full sidewalk, street lamps spaced more sparsely,
+// and three background clouds with varied scale/speed so their parallax
+// motion doesn't look mechanically identical.
+void initEnvironment() {
+    trees.clear();
+    for (double x = 40.0; x < WINDOW_WIDTH; x += 160.0) trees.push_back({x, 1.0});
+
+    streetLamps.clear();
+    for (double x = 90.0; x < WINDOW_WIDTH; x += 220.0) streetLamps.push_back({x});
+
+    clouds.clear();
+    clouds.push_back({150, 640, 1.0, 6.0});
+    clouds.push_back({500, 670, 1.3, 4.5});
+    clouds.push_back({850, 620, 0.8, 7.5});
+}
+
+// =====================================================================
+// ENVIRONMENT DRAWING
+// =====================================================================
+// Vertical two-color gradient quad for the sky, blended per-channel by
+// currentPalette, plus a scattered star field that only becomes visible
+// once moonAlpha rises past a small threshold during the night transition.
+void drawSky() {
+    glBegin(GL_QUADS);
+        glColor3f((float)currentPalette.skyTopR, (float)currentPalette.skyTopG, (float)currentPalette.skyTopB);
+        glVertex2f(0, WINDOW_HEIGHT); glVertex2f(WINDOW_WIDTH, WINDOW_HEIGHT);
+        glColor3f((float)currentPalette.skyBotR, (float)currentPalette.skyBotG, (float)currentPalette.skyBotB);
+        glVertex2f(WINDOW_WIDTH, (float)SIDEWALK_Y); glVertex2f(0, (float)SIDEWALK_Y);
+    glEnd();
+
+    if (currentPalette.moonAlpha > 0.05) {
+        glColor4f(1.0f, 1.0f, 1.0f, (float)currentPalette.moonAlpha);
+        for (int i = 0; i < 50; ++i) {
+            int sx = (i * 137) % WINDOW_WIDTH;
+            int sy = (int)SIDEWALK_Y + 350 + (i * 71) % 300;
+            setPixel(sx, sy);
+        }
+    }
+}
+
+// Sun and moon share one small orbit path (a slight ellipse via
+// sunMoonAngle) and are cross-faded by sunAlpha/moonAlpha rather than
+// being swapped outright, so during the lighting transition both can be
+// partially visible for a brief, natural-looking overlap. The sun also
+// gets a few progressively larger, progressively fainter glow rings drawn
+// underneath it via repeated midpointCircle calls.
+void drawSunMoon() {
+    double cx = 130.0 + 12.0 * sin(sunMoonAngle);
+    double cy = 610.0 + 8.0  * cos(sunMoonAngle);
+
+    if (currentPalette.sunAlpha > 0.02) {
+        for (int i = 3; i >= 1; --i) {
+            glColor4f((float)currentPalette.sunR, (float)currentPalette.sunG, (float)currentPalette.sunB,
+                      (float)(0.08 * i * currentPalette.sunAlpha));
+            midpointCircle(cx, cy, 32.0 + i*7, true);
+        }
+        glColor4f((float)currentPalette.sunR, (float)currentPalette.sunG, (float)currentPalette.sunB, (float)currentPalette.sunAlpha);
+        midpointCircle(cx, cy, 32.0, true);
+    }
+    if (currentPalette.moonAlpha > 0.02) {
+        glColor4f(0.92f, 0.92f, 0.96f, (float)currentPalette.moonAlpha);
+        midpointCircle(cx, cy, 26.0, true);
+        glColor4f(0.05f, 0.06f, 0.14f, (float)currentPalette.moonAlpha);
+        midpointCircle(cx + 10, cy + 4, 22.0, true);
+    }
+}
+
+// Each cloud is three overlapping midpointCircle discs, tinted darker at night.
+void drawSingleCloud(const Cloud& c) {
+    double shade = 1.0 - 0.45 * currentPalette.lampOn;
+    glColor3f((float)shade, (float)shade, (float)shade);
+    midpointCircle(c.x, c.y, 18.0*c.scale, true);
+    midpointCircle(c.x + 22*c.scale, c.y + 6*c.scale, 22.0*c.scale, true);
+    midpointCircle(c.x - 20*c.scale, c.y + 4*c.scale, 16.0*c.scale, true);
+}
+void drawClouds() { for (auto& c : clouds) drawSingleCloud(c); }
+
+void updateClouds() {
+    for (auto& c : clouds) {
+        Point2D moved = translatePoint({c.x, c.y}, c.speed * FIXED_DT * 10.0, 0.0);
+        c.x = moved.x;
+        if (c.x > WINDOW_WIDTH + 60) c.x = -60;
+    }
+}
+
+// -------------------------------------------------------------------------
+// Birds -- small ambient decoration, daytime only. Each bird is a pair of
+// Bresenham strokes forming a shallow "V" whose wing angle oscillates with
+// wingPhase, giving a simple flap animation with no additional primitives.
+// -------------------------------------------------------------------------
+void initBirds() {
+    birds.clear();
+    for (int i = 0; i < 6; ++i) {
+        double x = (double)((i * 197) % WINDOW_WIDTH);
+        double y = 560.0 + (double)((i * 83) % 100);
+        double speed = 30.0 + 8.0 * (i % 3);
+        birds.push_back({ x, y, speed, (double)i });
+    }
+}
+
+void updateBirds() {
+    for (auto& b : birds) {
+        Point2D moved = translatePoint({b.x, b.y}, b.speed * FIXED_DT, 0.0);
+        b.x = moved.x;
+        b.wingPhase += 0.25;
+        if (b.x > WINDOW_WIDTH + 20) b.x = -20.0;
+    }
+}
+
+void drawBirds() {
+    // Birds tuck away once the streetlamps are lit -- a cheap day/night cue
+    // that costs nothing extra since it reuses the existing lampOn value.
+    if (currentPalette.lampOn > 0.6) return;
+    glColor3f(0.15f, 0.15f, 0.15f);
+    for (auto& b : birds) {
+        double flap = 3.0 + 2.0 * sin(b.wingPhase);
+        bresenhamLine((int)(b.x - 8), (int)(b.y - flap), (int)b.x, (int)b.y);
+        bresenhamLine((int)(b.x + 8), (int)(b.y - flap), (int)b.x, (int)b.y);
+    }
+}
+
+// A single distant airliner crossing high overhead with a fading dashed
+// contrail (drawn with ddaLine) -- a small, relatable real-world touch
+// that fills the open sky rather than leaving it empty, day-only like
+// the birds. Position wraps the same way traffic does.
+double planeX = -80.0;
+const double PLANE_Y = 660.0, PLANE_SPEED = 16.0;
+
+void updatePlane() {
+    planeX += PLANE_SPEED * FIXED_DT;
+    if (planeX > WINDOW_WIDTH + 80.0) planeX = -80.0;
+}
+
+void drawPlane() {
+    if (currentPalette.lampOn > 0.6) return;
+    double x = planeX, y = PLANE_Y;
+    glColor4f(1.0f, 1.0f, 1.0f, 0.5f);
+    for (int i = 1; i <= 6; ++i) ddaLine(x - 10*i, y, x - 10*i - 6, y); // fading contrail dashes
+    glColor3f(0.85f, 0.85f, 0.88f);
+    drawRectangle(x - 14, y - 2, 28, 4, true);  // fuselage
+    drawRectangle(x - 14, y - 2, 4, 8, true);   // tailfin
+    drawRectangle(x - 4,  y - 8, 3, 16, true);  // wings
+}
+
+void drawTreeAt(double x, double y, double size) {
+    glColor3f(0.36f, 0.22f, 0.10f);
+    bresenhamLine((int)(x - 3*size), (int)y, (int)(x - 2*size), (int)(y + 22*size));
+    bresenhamLine((int)(x + 3*size), (int)y, (int)(x + 2*size), (int)(y + 22*size));
+    drawRectangle(x - 3*size, y, 6*size, 22*size, true);
+
+    double dim = 1.0 - 0.5 * currentPalette.lampOn;
+    glColor3f((float)(0.18*dim), (float)(0.42*dim), (float)(0.18*dim));
+    midpointCircle(x, y + 34*size, 16*size, true);
+    midpointCircle(x - 12*size, y + 26*size, 12*size, true);
+    midpointCircle(x + 12*size, y + 26*size, 12*size, true);
+}
+
+// Trees are spaced evenly along the full sidewalk width; drawTreeAt does
+// the actual composition (trunk + three overlapping canopy circles).
+void drawTrees() { for (auto& t : trees) drawTreeAt(t.x, SIDEWALK_Y + SIDEWALK_H, t.size); }
+
+// Street lamps: a pole (Bresenham-free simple rectangle since it's exactly
+// vertical), a mounting arm, and a midpointCircle bulb that only lights up
+// once currentPalette.lampOn crosses a threshold -- giving a hard-ish but
+// still palette-driven on/off transition layered on top of the smooth
+// sky/building lerp.
+void drawStreetLamps() {
+    for (auto& s : streetLamps) {
+        glColor3f(0.25f, 0.25f, 0.28f);
+        drawRectangle(s.x - 2, SIDEWALK_Y + SIDEWALK_H, 4, 46, true);
+        drawRectangle(s.x - 2, SIDEWALK_Y + SIDEWALK_H + 44, 16, 4, true);
+        if (currentPalette.lampOn > 0.05) {
+            glColor4f(1.0f, 0.92f, 0.55f, (float)(0.35 * currentPalette.lampOn));
+            midpointCircle(s.x + 14, SIDEWALK_Y + SIDEWALK_H + 42, 16.0, true);
+        }
+        double on = currentPalette.lampOn;
+        glColor3f((float)(0.6+0.4*on), (float)(0.6+0.3*on), (float)(0.55));
+        midpointCircle(s.x + 14, SIDEWALK_Y + SIDEWALK_H + 42, 5.0, true);
+    }
+}
+
+// Ground-floor awning -- decorative striped canopy over the entrance.
+void drawAwning(double x, double w, double y) {
+    int stripes = 5;
+    double stripeW = w / stripes;
+    for (int i = 0; i < stripes; ++i) {
+        glColor3f(i % 2 == 0 ? 0.75f : 0.92f, i % 2 == 0 ? 0.15f : 0.85f, i % 2 == 0 ? 0.15f : 0.85f);
+        drawRectangle(x + i*stripeW, y, stripeW, 10, true);
+    }
+}
+
+// Rooftop ledge + antenna mast -- breaks up the skyline's silhouette.
+void drawRooftopDetail(double x, double w, double topY, double shadeR, double shadeG, double shadeB) {
+    glColor3f((float)(shadeR*0.5), (float)(shadeG*0.5), (float)(shadeB*0.55));
+    drawRectangle(x - 3, topY, w + 6, 6, true); // ledge overhang
+
+    double mastX = x + w * 0.5;
+    glColor3f(0.3f, 0.3f, 0.32f);
+    bresenhamLine((int)mastX, (int)(topY + 6), (int)mastX, (int)(topY + 30));
+    if (currentPalette.lampOn > 0.4) {
+        glColor3f(1.0f, 0.2f, 0.2f); // aviation warning light
+        midpointCircle(mastX, topY + 30, 2.5, true);
+    }
+}
+
+void drawBuildings() {
+    for (size_t i = 0; i < buildings.size(); ++i) {
+        Building& b = buildings[i];
+        double shade = currentPalette.buildingShade;
+        glColor3f((float)(b.r*shade*1.6), (float)(b.g*shade*1.6), (float)(b.b*shade*1.6));
+        drawRectangle(b.x, SIDEWALK_Y, b.w, b.h, true);
+
+        // window grid: DDA mullion guide lines behind lit/unlit panes
+        glColor3f((float)(b.r*0.25), (float)(b.g*0.25), (float)(b.b*0.3));
+        int cols = max(1, (int)(b.w / 20));
+        int rows = max(1, (int)(b.h / 26));
+        for (int r = 0; r < rows; ++r)
+            ddaLine(b.x + 4, SIDEWALK_Y + 6 + r*26, b.x + b.w - 4, SIDEWALK_Y + 6 + r*26);
+        for (int c = 0; c < cols; ++c)
+            ddaLine(b.x + 4 + c*20, SIDEWALK_Y + 4, b.x + 4 + c*20, SIDEWALK_Y + b.h - 4);
+
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                double wx = b.x + 8 + c*20, wy = SIDEWALK_Y + 12 + r*26;
+                double pseudo = fmod((r*37 + c*53 + i*19) * 0.61803, 1.0);
+                bool lit = pseudo < currentPalette.windowLitChance;
+                if (lit) glColor3f(1.0f, 0.85f, 0.4f);
+                else     glColor3f((float)(b.r*0.4), (float)(b.g*0.4), (float)(b.b*0.45));
+                drawRectangle(wx, wy, 9, 14, true);
+            }
+        }
+
+        drawRooftopDetail(b.x, b.w, SIDEWALK_Y + b.h, b.r, b.g, b.b);
+        drawAwning(b.x + b.w*0.15, b.w*0.7, SIDEWALK_Y + 2);
+    }
+}
+
+// Road surface, a dashed center divider drawn with repeated short DDA
+// segments, and the pedestrian sidewalk with Bresenham tile-separator
+// lines. All colors derive from currentPalette.buildingShade so the road
+// darkens in step with the rest of the scene at night rather than needing
+// its own separate day/night constant.
+void drawRoad() {
+    double shade = currentPalette.buildingShade * 0.35;
+    glColor3f((float)shade, (float)shade, (float)(shade+0.02));
+    drawRectangle(0, ROAD_Y, WINDOW_WIDTH, ROAD_H, true);
+
+    // traffic divider drawn with DDA dashes
+    glColor3f(0.95f, 0.85f, 0.2f);
+    for (double x = 10; x < WINDOW_WIDTH; x += 45)
+        ddaLine(x, ROAD_Y + ROAD_H/2.0, x + 22, ROAD_Y + ROAD_H/2.0);
+
+    glColor3f(0.62f, 0.60f, 0.58f);
+    drawRectangle(0, SIDEWALK_Y, WINDOW_WIDTH, SIDEWALK_H, true);
+    glColor3f(0.50f, 0.48f, 0.46f);
+    for (double x = 0; x < WINDOW_WIDTH; x += 40) bresenhamLine((int)x, (int)SIDEWALK_Y, (int)x, (int)(SIDEWALK_Y+SIDEWALK_H));
+
+    // curb marking the road/sidewalk boundary -- a small realism detail
+    glColor3f(0.78f, 0.76f, 0.72f);
+    drawRectangle(0, SIDEWALK_Y - 3, WINDOW_WIDTH, 3, true);
+}
+
+// A bus gets a row of small passenger windows instead of the single
+// windshield pane a car/truck uses -- mostly to demonstrate scaling a
+// repeated sub-element (each pane is the same rectangle, translated).
+void drawBusWindows(const Vehicle& v) {
+    int paneCount = (int)(v.w / 18);
+    for (int i = 0; i < paneCount; ++i) {
+        glColor3f(0.75f, 0.9f, 1.0f);
+        drawRectangle(v.x + 8 + i*18, ROAD_Y + 12 + v.h*0.4, 12, v.h*0.35, true);
+    }
+    glColor3f(0.95f, 0.95f, 0.95f);
+    drawText(v.x + v.w*0.5 - 10, ROAD_Y + 12 + v.h + 2, "BUS", GLUT_BITMAP_HELVETICA_10, 0.95, 0.95, 0.95);
+}
+
+void drawCars() {
+    for (auto& v : vehicles) {
+        glColor4f(0.0f, 0.0f, 0.0f, 0.20f);
+        drawRectangle(v.x + 2, ROAD_Y + 8, v.w - 4, 5, true); // ground-contact shadow
+
+        glColor3f((float)v.r, (float)v.g, (float)v.b);
+        drawRectangle(v.x, ROAD_Y + 12, v.w, v.h, true);
+
+        if (v.isBus) {
+            drawBusWindows(v);
+        } else {
+            glColor3f(0.75f, 0.9f, 1.0f);
+            drawRectangle(v.x + v.w*0.6, ROAD_Y + 12 + v.h*0.45, v.w*0.3, v.h*0.4, true);
+        }
+
+        glColor3f(0.05f, 0.05f, 0.05f);
+        midpointCircle(v.x + v.w*0.22, ROAD_Y + 12, 7.0, true);
+        midpointCircle(v.x + v.w*0.78, ROAD_Y + 12, 7.0, true);
+        if (v.isBus) midpointCircle(v.x + v.w*0.5, ROAD_Y + 12, 7.0, true); // extra rear axle wheel
+
+        if (currentPalette.lampOn > 0.5) { glColor3f(1.0f, 0.95f, 0.6f); midpointCircle(v.x+v.w-2, ROAD_Y+12+v.h*0.5, 3.0, true); }
+    }
+}
+
+// Night-time wet-road reflections: each vehicle gets a faint, vertically
+// mirrored ghost drawn just below it on the road surface. The mirror is
+// produced with scalePoint (sy = -1 about a pivot on the road surface)
+// rather than a second hand-written draw routine, then faded with alpha.
+void drawWetReflections() {
+    if (currentPalette.lampOn < 0.3) return; // only worth it once lamps are on
+    for (auto& v : vehicles) {
+        Point2D pivot = { v.x, ROAD_Y + 12 };
+        Point2D corner1 = scalePoint({v.x, ROAD_Y + 12 + v.h}, pivot, 1.0, -1.0);
+        glColor4f((float)v.r, (float)v.g, (float)v.b, 0.18f);
+        drawRectangle(v.x, corner1.y, v.w, v.h * 0.6, true);
+    }
+}
+
+// Every vehicle just moves right at its own fixed speed and wraps back to
+// a staggered off-screen start once it clears the right edge -- simple
+// modular motion rather than a full traffic/spacing simulation, which
+// would be unnecessary complexity for a background layer.
+void animateCars() {
+    for (auto& v : vehicles) { v.x += v.speed * FIXED_DT; if (v.x > WINDOW_WIDTH + 100) v.x = -150; }
+}
+void animatePedestrians() {
+    for (auto& p : pedestrians) {
+        p.x += p.speed * FIXED_DT;
+        if (p.x > WINDOW_WIDTH - 20) p.x = 20;
+        if (p.x < 20) p.x = WINDOW_WIDTH - 20;
+        p.walkPhase += fabs(p.speed) * FIXED_DT * 0.35; // drives the leg-swing offset
+    }
+}
+
+void drawPedestrians() {
+    for (auto& p : pedestrians) {
+        glColor4f(0.0f, 0.0f, 0.0f, 0.18f);
+        midpointCircle(p.x, SIDEWALK_Y + 4, 6.0, true); // soft contact shadow
+        drawFigure(p.x, SIDEWALK_Y + 4, p.outfit, 1.0, 0.0, sin(p.walkPhase) * 4.0);
+    }
+}
+
+// =====================================================================
+// ACTORS: victim and Spider-Man (built from primitives + transforms)
+// =====================================================================
+// Shared figure-drawing routine for every humanoid (citizen + all four
+// pedestrians): legs are filled rectangles shifted sideways by legSwing
+// for the walk cycle, torso is a filled rectangle, arms are strokes in a
+// darker shirt shade, head is a skin-toned circle under a hair cap.
+// Every point goes through scalePoint then rotatePoint about (x,y), so
+// rotDeg = 90 produces the lying-down FAILURE pose from the same geometry.
+void drawFigure(double x, double y, const Outfit& o, double scale, double rotDeg = 0.0, double legSwing = 0.0) {
+    Point2D base = {x, y};
+    auto T = [&](double px, double py) {
+        return rotatePoint(scalePoint({px, py}, base, scale, scale), base, rotDeg);
+    };
+    auto fillQuad = [&](double rx, double ry, double rw, double rh) {
+        Point2D a=T(rx,ry), b=T(rx+rw,ry), c=T(rx+rw,ry+rh), d=T(rx,ry+rh);
+        glBegin(GL_QUADS);
+            glVertex2f((float)a.x,(float)a.y); glVertex2f((float)b.x,(float)b.y);
+            glVertex2f((float)c.x,(float)c.y); glVertex2f((float)d.x,(float)d.y);
+        glEnd();
+    };
+
+    // Legs -- filled rectangles, shifted sideways by legSwing (walk cycle)
+    glColor3f((float)o.pantsR, (float)o.pantsG, (float)o.pantsB);
+    fillQuad(x - 4 + legSwing*0.2, y,      3, 14);
+    fillQuad(x + 1 - legSwing*0.2, y,      3, 14);
+    glColor3f(0.12f, 0.12f, 0.12f); // shoes
+    fillQuad(x - 4 + legSwing*0.2, y - 2,  3, 2);
+    fillQuad(x + 1 - legSwing*0.2, y - 2,  3, 2);
+
+    // Torso
+    glColor3f((float)o.shirtR, (float)o.shirtG, (float)o.shirtB);
+    fillQuad(x - 5, y + 14, 10, 16);
+
+    // Arms -- a darker shade of the shirt color, swinging opposite the legs
+    glColor3f((float)(o.shirtR*0.8), (float)(o.shirtG*0.8), (float)(o.shirtB*0.8));
+    Point2D armL0 = T(x-5, y+26), armL1 = T(x-8+legSwing, y+16);
+    Point2D armR0 = T(x+5, y+26), armR1 = T(x+8-legSwing, y+16);
+    bresenhamLine((int)armL0.x,(int)armL0.y,(int)armL1.x,(int)armL1.y);
+    bresenhamLine((int)armR0.x,(int)armR0.y,(int)armR1.x,(int)armR1.y);
+
+    // Hair cap, then face on top of it
+    Point2D hairPos = T(x, y+34);
+    glColor3f((float)o.hairR, (float)o.hairG, (float)o.hairB);
+    midpointCircle(hairPos.x, hairPos.y, 5.8*scale, true);
+    Point2D facePos = T(x, y+32);
+    glColor3f((float)o.skinR, (float)o.skinG, (float)o.skinB);
+    midpointCircle(facePos.x, facePos.y, 5.0*scale, true);
+}
+
+// A short walk-cycle phase advanced only while the citizen is actually
+// walking (the WALK state); kept separate from the pedestrians' phases
+// so the citizen's gait doesn't need to share their vector.
+double victimWalkPhase = 0.0;
+
+// The citizen is drawFigure() in a fixed outfit. Standing upright through
+// WAITING/JUMPING/RESCUE/CARRY/TALK; legs swing only during WALK. On
+// FAILURE the citizen is placed resting at ground level and drawn
+// rotated 90 degrees (lying down) rather than disappearing -- the
+// outcome stays visible and honest without any graphic detail, and
+// nothing slides or vanishes off-screen.
+void drawVictim() {
+    double rot = (state == GameState::FAILURE) ? 90.0 : 0.0;
+    double legSwing = (state == GameState::WALK) ? sin(victimWalkPhase) * 4.0 : 0.0;
+    if (state != GameState::FAILURE && state != GameState::JUMPING) {
+        glColor4f(0.0f, 0.0f, 0.0f, 0.18f);
+        midpointCircle(victim.x, victim.y, 6.0, true);
+    }
+    drawFigure(victim.x, victim.y, victimOutfit, 1.0, rot, legSwing);
+}
+
+// Spider-Man is built from the exact same drawFigure() used by every
+// pedestrian and the citizen -- same legs/torso/arms/head construction --
+// just reskinned as a red-and-blue costume (mask-red "skin", a darker red
+// hair-cap shade for the mask crown, red shirt, blue tights) with a fixed
+// asymmetric arm/leg pose (legSwing) so he reads as an active, one-arm-
+// raised swinger rather than a standing pedestrian. The two-lens eyes,
+// web-pattern chest band, belt, emblem, and web-shooter cuff are then
+// layered on top at the same coordinates drawFigure uses internally.
+void drawSpiderMan() {
+    if (!spiderActive) return;
+    static const Outfit spidey = { 0.85,0.05,0.08,  0.55,0.03,0.05,  0.85,0.05,0.08,  0.12,0.20,0.55 };
+    double x = spider.x, y = spider.y;
+    drawFigure(x, y, spidey, 1.0, 0.0, -8.0); // a wide-armed swinging pose, not a standing gait
+
+    // two-lens mask eyes, over the face circle drawFigure already drew
+    glColor3f(0.95f, 0.95f, 0.95f);
+    midpointCircle(x-3, y+33, 2.2, true);
+    midpointCircle(x+3, y+33, 2.2, true);
+    glColor3f(0.05f, 0.05f, 0.08f);
+    midpointCircle(x-3, y+33, 1.1, true);
+    midpointCircle(x+3, y+33, 1.1, true);
+
+    // web-pattern chest band, belt, and emblem, over the torso quad
+    glColor3f(0.05f, 0.05f, 0.1f);
+    drawRectangle(x-5, y+23, 10, 3, true);
+    drawRectangle(x-6, y+14, 12, 3, true); // belt
+    glColor3f(0.02f, 0.02f, 0.04f);
+    midpointCircle(x, y+22, 3.0, false); // outline "emblem" ring, unfilled circle
+
+    // web-shooter cuff near the raised wrist
+    glColor3f(0.1f, 0.1f, 0.12f);
+    drawRectangle(x-10, y+14, 4, 3, true);
+}
+
+// Web line drawn as a sagging cubic Bezier from the anchor to Spider-Man's
+// hand. The curve itself is drawn with the GL line strip for a smooth
+// appearance, but each of its straight sub-segments is also independently
+// passed through cohenSutherlandClip before being re-rendered as a
+// Bresenham stroke slightly offset to the side -- a visible "core strand"
+// that demonstrates the clipping algorithm operating on real per-frame
+// geometry rather than only the static debug grid.
+void drawWeb() {
+    if (!showWeb) return;
+    Point2D p0 = webAnchor;
+    Point2D p3 = { spider.x, spider.y + 22 };
+    double midX = (p0.x + p3.x) / 2.0;
+    double sag  = 18.0 + 0.05 * fabs(p0.x - p3.x);
+    Point2D p1 = { p0.x + (midX - p0.x) * 0.4, p0.y - sag * 0.6 };
+    Point2D p2 = { p3.x + (midX - p3.x) * 0.4, p3.y - sag * 0.2 };
+
+    glColor4f(0.9f, 0.9f, 0.9f, 0.85f);
+    bezierCurve(p0, p1, p2, p3, 24);
+
+    // Sample the same Bezier at a coarser resolution for the clipped core
+    // strand, so the clipping pass has real segment endpoints to work with.
+    glColor4f(1.0f, 1.0f, 1.0f, 0.5f);
+    const int coreSegments = 8;
+    Point2D prev = p0;
+    for (int i = 1; i <= coreSegments; ++i) {
+        double t = (double)i / coreSegments, u = 1.0 - t;
+        Point2D cur = {
+            u*u*u*p0.x + 3*u*u*t*p1.x + 3*u*t*t*p2.x + t*t*t*p3.x,
+            u*u*u*p0.y + 3*u*u*t*p1.y + 3*u*t*t*p2.y + t*t*t*p3.y
+        };
+        drawClippedLine(prev.x, prev.y, cur.x, cur.y);
+        prev = cur;
+    }
+}
+
+// =====================================================================
+// IMPACT PARTICLES (tasteful, non-graphic failure cue)
+// =====================================================================
+// This module exists solely to give the FAILURE outcome a clear, felt
+// "something happened" moment without depicting injury: 18 small dots are
+// scattered outward from the impact point in a full circle, fall briefly
+// under half-strength gravity, and fade out over roughly a second. No
+// color or motion here is meant to read as blood -- it's a generic,
+// abstracted burst of the kind used in many family-friendly games for a
+// failure state.
+void spawnImpactParticles(double x, double y) {
+    particles.clear();
+    for (int i = 0; i < 18; ++i) {
+        double ang = (double)i / 18.0 * 2.0 * PI;
+        double speed = 40.0 + (i % 5) * 12.0;
+        particles.push_back({ x, y, cos(ang)*speed, sin(ang)*speed*0.6 + 40.0, 1.0 });
+    }
+    particlesActive = true;
+}
+
+// Advances every particle by one tick and clears particlesActive once all
+// of them have faded (life <= 0), so drawImpactParticles/activeParticleCount
+// can cheaply skip work once the burst is finished instead of checking
+// each particle's lifetime every frame from the outside.
+void animateImpactParticles() {
+    if (!particlesActive) return;
+    bool any = false;
+    for (auto& p : particles) {
+        Point2D moved = translatePoint({p.x,p.y}, p.vx*FIXED_DT, p.vy*FIXED_DT);
+        p.x = moved.x; p.y = moved.y;
+        p.vy -= GRAVITY * 0.5 * FIXED_DT;
+        p.life -= FIXED_DT * 0.9;
+        if (p.life > 0) any = true;
+    }
+    if (!any) particlesActive = false;
+}
+
+// Each particle is a small filled midpointCircle whose alpha is driven
+// directly by its remaining life, giving the burst a natural fade-out
+// without a separate timer or animation curve.
+void drawImpactParticles() {
+    if (!particlesActive) return;
+    for (auto& p : particles) {
+        glColor4f(0.85f, 0.2f, 0.2f, (float)p.life);
+        midpointCircle(p.x, p.y, 3.0, true);
+    }
+}
+// Reports how many impact particles are currently live -- used only by
+// the diagnostics info panel, so it deliberately doesn't need to be exact
+// once particlesActive is false (returns 0 immediately in that case).
+int activeParticleCount() { return particlesActive ? (int)particles.size() : 0; }
+
+// =====================================================================
+// HUD
+// =====================================================================
+// Full-screen translucent overlay plus two lines of centered text, shared
+// by both the SUCCESS and FAILURE outcomes so they read as a matched pair
+// visually (only the headline color and wording differ).
+void drawBanner(const string& line1, const string& line2, double r, double g, double b) {
+    glColor4f(0.0f, 0.0f, 0.0f, 0.55f);
+    drawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, true);
+    drawCenteredText(WINDOW_WIDTH/2.0, WINDOW_HEIGHT/2.0 + 20, line1, GLUT_BITMAP_TIMES_ROMAN_24, r, g, b);
+    drawCenteredText(WINDOW_WIDTH/2.0, WINDOW_HEIGHT/2.0 - 12, line2, GLUT_BITMAP_HELVETICA_18, 1,1,1);
+    drawCenteredText(WINDOW_WIDTH/2.0, WINDOW_HEIGHT/2.0 - 40, "Press R to Restart", GLUT_BITMAP_HELVETICA_18, 1,1,1);
+}
+
+// -------------------------------------------------------------------------
+// Debug coordinate grid -- toggled with 'G'. Draws a 100px grid using DDA
+// lines and labels each major line, handy for reporting exact building /
+// road coordinates during development or a viva walkthrough.
+// -------------------------------------------------------------------------
+void drawDebugGrid() {
+    if (!showDebugGrid) return;
+    glColor4f(1.0f, 1.0f, 1.0f, 0.25f);
+    for (int x = 0; x <= WINDOW_WIDTH; x += 100) {
+        double cx0 = x, cy0 = 0, cx1 = x, cy1 = WINDOW_HEIGHT;
+        drawClippedLine(cx0, cy0, cx1, cy1);
+    }
+    for (int y = 0; y <= WINDOW_HEIGHT; y += 100) {
+        double cx0 = 0, cy0 = y, cx1 = WINDOW_WIDTH, cy1 = y;
+        drawClippedLine(cx0, cy0, cx1, cy1);
+    }
+    glColor4f(1.0f, 1.0f, 0.6f, 0.7f);
+    for (int x = 0; x <= WINDOW_WIDTH; x += 100) {
+        char buf[8]; snprintf(buf, sizeof(buf), "%d", x);
+        drawText(x + 2, 4, buf, GLUT_BITMAP_HELVETICA_10, 1, 1, 0.6);
+    }
+    for (int y = 0; y <= WINDOW_HEIGHT; y += 100) {
+        char buf[8]; snprintf(buf, sizeof(buf), "%d", y);
+        drawText(2, y + 2, buf, GLUT_BITMAP_HELVETICA_10, 1, 1, 0.6);
+    }
+}
+
+// Human-readable label for the current GameState -- used only by the
+// on-screen diagnostics panel, kept separate from the state machine so
+// the switch that actually drives gameplay logic stays uncluttered.
+string stateLabel() {
+    switch (state) {
+        case GameState::WAITING: return "WAITING";
+        case GameState::JUMPING: return "JUMPING";
+        case GameState::RESCUE:  return "RESCUE";
+        case GameState::CARRY:   return "CARRY";
+        case GameState::TALK:    return "TALK";
+        case GameState::WALK:    return "WALK";
+        case GameState::SUCCESS: return "SUCCESS";
+        case GameState::FAILURE: return "FAILURE";
+    }
+    return "?";
+}
+
+string lightingLabel() {
+    if (lightTransition < 1.0) return activeLightMode == LightingMode::DAY ? "DAY -> NIGHT" : "NIGHT -> DAY";
+    return activeLightMode == LightingMode::DAY ? "DAY" : "NIGHT";
+}
+
+// Small translucent diagnostics panel in the corner -- state name, elapsed
+// simulated time, current lighting mode, and active particle count. Purely
+// informational; doesn't affect gameplay, but is useful when demonstrating
+// the state machine during a viva ("see, it's now in RESCUE...").
+void drawInfoPanel() {
+    double px = WINDOW_WIDTH - 230.0, py = WINDOW_HEIGHT - 130.0;
+    glColor4f(0.0f, 0.0f, 0.0f, 0.35f);
+    drawRectangle(px, py, 214, 90, true);
+    glColor4f(1.0f, 1.0f, 1.0f, 0.6f);
+    drawRectangle(px, py, 214, 90, false);
+
+    char line[64];
+    drawText(px + 10, py + 68, "STATE: " + stateLabel(), GLUT_BITMAP_HELVETICA_12, 1,1,1);
+    snprintf(line, sizeof(line), "Elapsed: %.1fs", tickCounter * FIXED_DT);
+    drawText(px + 10, py + 50, line, GLUT_BITMAP_HELVETICA_12, 1,1,1);
+    drawText(px + 10, py + 32, "Lighting: " + lightingLabel(), GLUT_BITMAP_HELVETICA_12, 1,1,1);
+    snprintf(line, sizeof(line), "Particles: %d", activeParticleCount());
+    drawText(px + 10, py + 14, line, GLUT_BITMAP_HELVETICA_12, 1,1,1);
+}
+
+// Expanded controls reference, toggled with 'H'. The single-line hint at
+// the top of the HUD is always visible; this panel is the fuller
+// explanation of what each key does and in which state it matters --
+// handy to leave open during a live demo instead of narrating verbally.
+void drawControlsPanel() {
+    if (!showControlsPanel) return;
+    double px = 16.0, py = WINDOW_HEIGHT - 340.0;
+    double pw = 360.0, ph = 260.0;
+
+    glColor4f(0.0f, 0.0f, 0.0f, 0.55f);
+    drawRectangle(px, py, pw, ph, true);
+    glColor4f(1.0f, 1.0f, 1.0f, 0.7f);
+    drawRectangle(px, py, pw, ph, false);
+
+    struct Row { const char* key; const char* desc; };
+    Row rows[] = {
+        { "S",     "Save the citizen (WAITING or JUMPING only)" },
+        { "D",     "Request Day lighting (fades in over ~1.5s)" },
+        { "N",     "Request Night lighting (fades in over ~1.5s)" },
+        { "P",     "Pause / resume the entire simulation" },
+        { "G",     "Toggle the debug coordinate grid" },
+        { "H",     "Toggle this controls panel" },
+        { "R",     "Restart the scene from WAITING" },
+        { "Esc/Q", "Quit the program" },
+    };
+    int rowCount = (int)(sizeof(rows) / sizeof(rows[0]));
+
+    drawText(px + 12, py + ph - 24, "CONTROLS", GLUT_BITMAP_HELVETICA_18, 1,0.9,0.3);
+    for (int i = 0; i < rowCount; ++i) {
+        double ry = py + ph - 56 - i * 26;
+        glColor4f(1.0f, 0.85f, 0.3f, 1.0f);
+        drawText(px + 12, ry, string("[") + rows[i].key + "]", GLUT_BITMAP_HELVETICA_12, 1,0.85,0.3);
+        drawText(px + 70, ry, rows[i].desc, GLUT_BITMAP_HELVETICA_12, 1,1,1);
+    }
+}
+
+void drawHUD() {
+    drawInfoPanel();
+    drawControlsPanel();
+    drawText(16, WINDOW_HEIGHT - 26, "Spider-Man Rescue: Interactive Urban Rescue Simulation", GLUT_BITMAP_HELVETICA_18, 1,1,1);
+    drawText(16, WINDOW_HEIGHT - 46, "[S] Save  [D] Day  [N] Night  [P] Pause/Resume  [G] Grid  [H] Help  [R] Restart  [Esc] Quit", GLUT_BITMAP_HELVETICA_12, 1,1,1);
+
+    if (state == GameState::WAITING) {
+        drawCenteredText(WINDOW_WIDTH/2.0, WINDOW_HEIGHT - 90, "Press S to Save the Person", GLUT_BITMAP_HELVETICA_18, 1.0,0.9,0.2);
+        char buf[8]; snprintf(buf, sizeof(buf), "%d", (int)ceil(countdown));
+        drawCenteredText(WINDOW_WIDTH/2.0, WINDOW_HEIGHT - 120, buf, GLUT_BITMAP_TIMES_ROMAN_24, 1.0,0.9,0.2);
+    }
+    if (state == GameState::JUMPING)
+        drawCenteredText(WINDOW_WIDTH/2.0, WINDOW_HEIGHT - 90, "PRESS S TO SAVE THEM!", GLUT_BITMAP_HELVETICA_18, 1.0,0.9,0.2);
+    if (state == GameState::TALK)
+        drawText(victim.x - 40, victim.y + 55, "\"Thank you!\"", GLUT_BITMAP_HELVETICA_12, 1,1,1);
+    if (state == GameState::SUCCESS) drawBanner("MISSION SUCCESS", "Person Saved", 0.3,0.95,0.4);
+    if (state == GameState::FAILURE) drawBanner("MISSION FAILED", "The citizen wasn't reached in time.", 0.95,0.25,0.25);
+    if (isPaused && state != GameState::SUCCESS && state != GameState::FAILURE)
+        drawCenteredText(WINDOW_WIDTH/2.0, WINDOW_HEIGHT/2.0, "PAUSED", GLUT_BITMAP_TIMES_ROMAN_24, 1,1,0.4);
+}
+
+// =====================================================================
+// GAME LOGIC
+// =====================================================================
+
+// Homing swing: rather than a fixed-radius, fixed-speed pendulum, the
+// swing continuously re-aims itself at the citizen's live position (in
+// polar coordinates around the web anchor) every tick, at a fast but
+// capped angular/radial speed. This guarantees Spider-Man can intercept
+// the citizen from any starting height and at any press timing -- there
+// is no "safe window" the player has to time correctly; pressing S at
+// the very last instant still results in a catch, just a tighter one.
+const double SWING_MAX_ANGULAR_SPEED = 480.0; // degrees/sec
+const double SWING_MAX_RADIAL_SPEED  = 720.0; // px/sec
+
+// Sets Spider-Man's initial polar position (angle + radius around the
+// anchor) to match where he's actually standing, so the homing swing
+// starts exactly from his rooftop position rather than snapping.
+void beginRescue() {
+    webAnchor = { buildingCenterX(ANCHOR_BUILDING), buildingTopY(ANCHOR_BUILDING) };
+    double dx = spider.x - webAnchor.x, dy = spider.y - webAnchor.y;
+    swingLen = sqrt(dx*dx + dy*dy);
+    swingAngleDeg = atan2(dx, -dy) * 180.0 / PI;
+    spiderActive = true;
+    showWeb = true;
+    state = GameState::RESCUE;
+    stateTimer = 0.0;
+    logEvent("Spider-Man launched on the rescue web.");
+}
+void triggerSave() {
+    if (state != GameState::WAITING && state != GameState::JUMPING) return;
+    logEvent("'S' pressed -- attempting rescue.");
+    if (state == GameState::WAITING) { state = GameState::JUMPING; stateTimer = 0.0; victimVel = {0,0}; }
+    beginRescue();
+}
+
+// Simple radius-threshold collision test between Spider-Man and the
+// citizen -- sufficient given both are small stylized figures; a full
+// axis-aligned bounding-box test would be overkill and visually no more
+// accurate at this figure scale.
+bool collisionSpiderVictim() {
+    double dx = spider.x - victim.x, dy = spider.y - victim.y;
+    return sqrt(dx*dx + dy*dy) < 26.0;
+}
+
+// The citizen has "reached the street" once their y-position drops to
+// just above the sidewalk band -- checked every JUMPING tick.
+bool collisionVictimGround() { return victim.y <= SIDEWALK_Y + 20.0; }
+
+// Semi-implicit Euler integration of free fall: velocity accumulates
+// GRAVITY every tick, then position is translated downward by that
+// velocity scaled by the timestep. translatePoint takes a negative dy
+// since world-space y increases upward in this projection.
+void updateVictimFall() {
+    victimVel.y += GRAVITY * FIXED_DT;
+    Point2D moved = translatePoint(victim, 0.0, -victimVel.y * FIXED_DT);
+    victim = moved;
+}
+
+// The swing is guided, not a fixed pendulum: every tick, the target angle
+// and target web length are recomputed from Spider-Man's anchor point to
+// the citizen's CURRENT falling position, and swingAngleDeg/swingLen are
+// stepped toward those targets at a bounded angular/radial speed (via
+// rotatePoint around the anchor each frame). This is what makes a catch
+// possible from anywhere and at any timing -- earlier versions rotated at
+// a fixed rate along a fixed-radius arc that only intersected the citizen
+// by coincidence; now the web actively reels in and swings to track a
+// moving target, the way an aimed rescue actually would.
+void updateSpiderSwing() {
+    double dx = victim.x - webAnchor.x, dy = victim.y - webAnchor.y;
+    double targetAngle = atan2(dx, -dy) * 180.0 / PI;
+    double targetLen   = sqrt(dx*dx + dy*dy);
+
+    double angleDiff = targetAngle - swingAngleDeg;
+    while (angleDiff > 180.0)  angleDiff -= 360.0;
+    while (angleDiff < -180.0) angleDiff += 360.0;
+    double maxAngleStep = SWING_MAX_ANGULAR_SPEED * FIXED_DT;
+    swingAngleDeg += (fabs(angleDiff) < maxAngleStep) ? angleDiff
+                                                        : (angleDiff > 0 ? maxAngleStep : -maxAngleStep);
+
+    double lenDiff = targetLen - swingLen;
+    double maxLenStep = SWING_MAX_RADIAL_SPEED * FIXED_DT;
+    swingLen += (fabs(lenDiff) < maxLenStep) ? lenDiff : (lenDiff > 0 ? maxLenStep : -maxLenStep);
+
+    Point2D restPos = { webAnchor.x, webAnchor.y - swingLen }; // straight down from anchor
+    spider = rotatePoint(restPos, webAnchor, swingAngleDeg);
+}
+
+void updateGame() {
+    if (isPaused) return;
+    tickCounter++;
+    stateTimer += FIXED_DT;
+    animateCars();
+    animatePedestrians();
+    updateClouds();
+    updateBirds();
+    updatePlane();
+    animateImpactParticles();
+    updateLighting();
+    if (shakeTimeLeft > 0.0) shakeTimeLeft -= FIXED_DT;
+    sunMoonAngle += 0.01;
+    if (sunMoonAngle > 2*PI) sunMoonAngle -= 2*PI;
+
+    switch (state) {
+        // ---------------------------------------------------------------
+        // WAITING: the citizen stands at the rooftop edge. The countdown
+        // is purely a tension device -- pressing S here is just as valid
+        // as pressing it during the fall, since triggerSave() handles both.
+        // ---------------------------------------------------------------
+        case GameState::WAITING:
+            countdown -= FIXED_DT;
+            if (countdown <= 0.0) { state = GameState::JUMPING; stateTimer = 0.0; victimVel = {0,0}; }
+            break;
+
+        // ---------------------------------------------------------------
+        // JUMPING: free-fall under gravity (see updateVictimFall). Ends
+        // either by a successful 'S' press (which jumps straight into
+        // RESCUE via beginRescue/triggerSave) or by the citizen reaching
+        // the sidewalk, which resolves to FAILURE with the tasteful
+        // particle-burst cue and a brief camera shake -- no gore.
+        // ---------------------------------------------------------------
+        case GameState::JUMPING:
+            updateVictimFall();
+            if (collisionVictimGround()) {
+                spawnImpactParticles(victim.x, SIDEWALK_Y + 6.0);
+                victim.y = SIDEWALK_Y + 6.0; // rest at ground level; drawVictim() lies them down here
+                shakeTimeLeft = 0.35; // brief, subtle camera shake -- not gore, just weight
+                state = GameState::FAILURE; stateTimer = 0.0;
+                logEvent("MISSION FAILED -- citizen was not reached in time.");
+            }
+            break;
+
+        // ---------------------------------------------------------------
+        // RESCUE: Spider-Man swings on the web (updateSpiderSwing, driven
+        // by rotatePoint) while the citizen keeps falling under the same
+        // gravity model as JUMPING. A successful catch is a simple
+        // distance-threshold collision check, not full rectangle overlap
+        // -- appropriate given both actors are drawn as small figures.
+        // ---------------------------------------------------------------
+        case GameState::RESCUE:
+            updateSpiderSwing();
+            updateVictimFall();
+            if (collisionSpiderVictim()) { state = GameState::CARRY; stateTimer = 0.0; }
+            break;
+
+        // ---------------------------------------------------------------
+        // CARRY: Spider-Man walks the caught citizen (locked to his
+        // position with a small offset) toward the landing spot in front
+        // of Building 3, at a constant speed via translatePoint. Once
+        // within one step of the target, position snaps exactly onto it
+        // to avoid an asymptotic "never quite arrives" approach.
+        // ---------------------------------------------------------------
+        case GameState::CARRY: {
+            showWeb = false;
+            double tx = buildingCenterX(LAND_BUILDING) - 40.0, ty = SIDEWALK_Y + 30.0;
+            double dx = tx - spider.x, dy = ty - spider.y, dist = sqrt(dx*dx+dy*dy);
+            double step = 220.0 * FIXED_DT;
+            if (dist > step) { Point2D m = translatePoint(spider, dx/dist*step, dy/dist*step); spider = m; }
+            else { spider = {tx, ty}; state = GameState::TALK; stateTimer = 0.0; }
+            victim = { spider.x + 14.0, spider.y };
+            break;
+        }
+
+        // ---------------------------------------------------------------
+        // TALK: a fixed 2-second pause with a speech-bubble line drawn in
+        // drawHUD(). Purely a beat for pacing -- nothing moves here.
+        // ---------------------------------------------------------------
+        case GameState::TALK:
+            if (stateTimer >= 2.0) { state = GameState::WALK; stateTimer = 0.0; }
+            break;
+
+        // ---------------------------------------------------------------
+        // WALK: the citizen is released to walk normally along the
+        // sidewalk while Spider-Man swings back off-frame (a simple sine
+        // bob standing in for a swing motion as he exits stage-left).
+        // Once he's fully off-screen the scene resolves to SUCCESS.
+        // ---------------------------------------------------------------
+        case GameState::WALK: {
+            Point2D mv = translatePoint(victim, 30.0*FIXED_DT, 0.0);
+            victim = { mv.x, SIDEWALK_Y + 4.0 };
+            victimWalkPhase += FIXED_DT * 6.0;
+            Point2D ms = translatePoint(spider, -260.0*FIXED_DT, 0.0);
+            spider = { ms.x, buildingTopY(WEB_BUILDING) - 10.0 + 40.0*sin(stateTimer*3.0) };
+            if (spider.x < -60.0) {
+                state = GameState::SUCCESS; stateTimer = 0.0; spiderActive = false;
+                logEvent("MISSION SUCCESS -- citizen safely delivered to the walkway.");
+            }
+            break;
+        }
+
+        // ---------------------------------------------------------------
+        // SUCCESS / FAILURE: terminal states. The scene keeps animating
+        // in the background (traffic, pedestrians, lighting) but nothing
+        // in the rescue story advances until the player presses 'R',
+        // which calls restartGame() and returns to WAITING.
+        // ---------------------------------------------------------------
+        case GameState::SUCCESS:
+        case GameState::FAILURE:
+            break; // wait for R
+    }
+}
+
+// =====================================================================
+// KEYBOARD
+// =====================================================================
+// Single classic-GLUT keyboard callback (glutKeyboardFunc), registered
+// once in main(). Every key is handled case-insensitively by listing both
+// the lower- and upper-case ASCII values, since GLUT does not normalize
+// case for the standard keyboard callback the way some toolkits do.
+void keyboard(unsigned char key, int, int) {
+    switch (key) {
+        case 's': case 'S': triggerSave(); break;
+        case 'd': case 'D': requestLightMode(LightingMode::DAY); break;
+        case 'n': case 'N': requestLightMode(LightingMode::NIGHT); break;
+        case 'p': case 'P': isPaused = !isPaused; logEvent(isPaused ? "Simulation paused." : "Simulation resumed."); break;
+        case 'g': case 'G': showDebugGrid = !showDebugGrid; break;
+        case 'h': case 'H': showControlsPanel = !showControlsPanel; break;
+        case 'r': case 'R': restartGame(); break;
+        case 27: case 'q': case 'Q': exit(0);
+    }
+}
+
+// =====================================================================
+// GLUT CALLBACKS
+// =====================================================================
+// display() draws exactly one frame in back-to-front order: sky and
+// celestial objects first, then background scenery, then the road layer
+// and everything on it, then the rescue actors, then all overlay/HUD
+// content last so it always sits on top regardless of what's beneath it.
+void display() {
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLoadIdentity();
+
+    // Brief camera shake on failure -- a small, decaying random offset
+    // computed once per frame via translatePoint, applied as a GL
+    // translation so every primitive drawn this frame inherits it without
+    // each draw function needing to know about it.
+    if (shakeTimeLeft > 0.0) {
+        double mag = 4.0 * (shakeTimeLeft / 0.35);
+        Point2D offset = translatePoint({0,0}, ((rand()%200)-100)/100.0*mag, ((rand()%200)-100)/100.0*mag);
+        glTranslatef((float)offset.x, (float)offset.y, 0.0f);
+    }
+
+    drawSky();
+    drawSunMoon();
+    drawClouds();
+    drawBirds();
+    drawPlane();
+    drawBuildings();
+    drawTrees();
+    drawRoad();
+    drawWetReflections();
+    drawStreetLamps();
+    drawCars();
+    drawPedestrians();
+
+    drawWeb();
+    drawVictim();
+    drawSpiderMan();
+    drawImpactParticles();
+
+    drawDebugGrid();
+    drawHUD();
+
+    glutSwapBuffers();
+}
+
+// Recomputes the orthographic projection whenever the window is resized,
+// keeping world coordinates fixed at (0,0)-(WINDOW_WIDTH,WINDOW_HEIGHT)
+// regardless of the actual pixel size of the window -- so the scene
+// stretches to fill the window rather than the coordinate system shifting.
+void reshape(int w, int h) {
+    glViewport(0, 0, w, h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0, WINDOW_WIDTH, 0, WINDOW_HEIGHT);
+    glMatrixMode(GL_MODELVIEW);
+}
+
+// The whole simulation advances on this fixed-rate timer rather than in
+// the display callback, so game logic runs at a consistent 1/TIMER_MS
+// rate independent of how often the window actually gets redrawn.
+void timerFunc(int) {
+    updateGame();
+    glutPostRedisplay();
+    glutTimerFunc(TIMER_MS, timerFunc, 0);
+}
+
+// =====================================================================
+// DIAGNOSTICS
+// =====================================================================
+
+// Lightweight console logger for state-changing events (pause/resume,
+// rescue attempts, mission outcomes, lighting changes). Timestamps aren't
+// necessary here since the tick loop is fixed-rate; this exists purely to
+// give a readable trace of what happened during a run for debugging or a
+// viva walkthrough, without cluttering the on-screen HUD.
+void logEvent(const string& msg) {
+    printf("[event] %s\n", msg.c_str());
+}
+
+// Sanity-checks the seven-building skyline layout at startup: confirms no
+// two buildings overlap horizontally and that the key story buildings
+// (jump / anchor / web-launch / landing) are distinct and in a sensible
+// left-to-right order. Doesn't stop the program on failure -- it's a
+// development aid, printed once before the window opens -- but it catches
+// layout mistakes (e.g. two buildings assigned the same index) immediately
+// instead of letting them show up as a visually broken scene.
+void verifyLayoutNonOverlapping() {
+    bool anyOverlap = false;
+    for (size_t i = 0; i < buildings.size(); ++i) {
+        for (size_t j = i + 1; j < buildings.size(); ++j) {
+            double leftI = buildings[i].x, rightI = buildings[i].x + buildings[i].w;
+            double leftJ = buildings[j].x, rightJ = buildings[j].x + buildings[j].w;
+            bool overlap = leftI < rightJ && leftJ < rightI;
+            if (overlap) {
+                anyOverlap = true;
+                printf("[layout warning] Building %zu overlaps Building %zu\n", i+1, j+1);
+            }
+        }
+    }
+    if (!anyOverlap) {
+        printf("[layout check] All %zu buildings are clear of one another.\n", buildings.size());
+    }
+
+    int keyIndices[4] = { JUMP_BUILDING, ANCHOR_BUILDING, WEB_BUILDING, LAND_BUILDING };
+    const char* keyNames[4] = { "jump", "anchor", "web-launch", "landing" };
+    bool distinctOk = true;
+    for (int a = 0; a < 4 && distinctOk; ++a)
+        for (int b = a + 1; b < 4; ++b)
+            if (keyIndices[a] == keyIndices[b]) {
+                printf("[layout warning] %s and %s buildings share the same index (%d)\n",
+                       keyNames[a], keyNames[b], keyIndices[a]);
+                distinctOk = false;
+            }
+    if (distinctOk) {
+        printf("[layout check] jump/anchor/web-launch/landing buildings are all distinct "
+               "(Building %d / %d / %d / %d).\n",
+               JUMP_BUILDING+1, ANCHOR_BUILDING+1, WEB_BUILDING+1, LAND_BUILDING+1);
+    }
+}
+
+void printStartupBanner() {
+    printf("=========================================================\n");
+    printf("  SPIDER-MAN RESCUE -- CG Lab Project\n");
+    printf("  Controls: S save | D day | N night | P pause | G grid\n");
+    printf("            R restart | Esc/Q quit\n");
+    printf("=========================================================\n");
+}
+
+// =====================================================================
+// RESTART / INIT
+// =====================================================================
+// Resets every piece of mutable rescue-story state back to its starting
+// values and re-seeds traffic/pedestrians -- called both once at startup
+// (from initGL) and every time the player presses 'R'. Deliberately does
+// NOT reset lighting mode, tick counter, or the debug/help panel toggles,
+// since those are session-level settings the player likely wants to
+// persist across a restart rather than snapping back to defaults.
+void restartGame() {
+    state = GameState::WAITING;
+    stateTimer = 0.0;
+    countdown = COUNTDOWN_START;
+    isPaused = false;
+
+    victim = { buildingCenterX(JUMP_BUILDING), buildingTopY(JUMP_BUILDING) };
+    victimVel = {0,0};
+    victimWalkPhase = 0.0;
+
+    spider = { buildingCenterX(WEB_BUILDING), buildingTopY(WEB_BUILDING) };
+    spiderActive = false;
+    showWeb = false;
+
+    particlesActive = false;
+    particles.clear();
+
+    initVehicles();
+    initPedestrians();
+    logEvent("Scene restarted.");
+}
+
+// One-time OpenGL and scene setup, called once from main() before the
+// GLUT callbacks are registered. Blending and point/line smoothing are
+// enabled globally up front since every primitive in the scene (particles,
+// glow rings, antialiased strokes) relies on them; there's no per-draw
+// state toggling needed anywhere else in the program as a result.
+void initGL() {
+    glClearColor(0, 0, 0, 1);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_POINT_SMOOTH);
+    glEnable(GL_LINE_SMOOTH);
+    glPointSize(1.6f);
+    glLineWidth(1.4f);
+
+    printStartupBanner();
+
+    initBuildings();
+    initEnvironment();
+    initBirds();
+    currentPalette = paletteForMode(activeLightMode);
+    verifyLayoutNonOverlapping();
+    restartGame();
+}
+
+// =====================================================================
+// MAIN
+// =====================================================================
+// Standard classic-GLUT bootstrap: create the window, run one-time GL and
+// scene initialization, register the three callbacks the whole program
+// needs (display, reshape, keyboard), start the fixed-rate timer that
+// drives every animation and state transition, then hand control to
+// glutMainLoop(), which never returns during normal operation -- the
+// program exits via the Esc/Q key calling exit(0) directly.
+int main(int argc, char** argv) {
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
+    glutInitWindowSize(WINDOW_WIDTH, WINDOW_HEIGHT);
+    glutInitWindowPosition(60, 40);
+    glutCreateWindow(WINDOW_TITLE);
+
+    initGL();
+
+    glutDisplayFunc(display);
+    glutReshapeFunc(reshape);
+    glutKeyboardFunc(keyboard);
+    glutTimerFunc(TIMER_MS, timerFunc, 0);
+
+    glutMainLoop();
+    return 0;
+}
